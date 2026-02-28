@@ -113,12 +113,12 @@ class XGBoostForexModel:
             X_train, X_val = X[train_idx], X[val_idx]
             y_train, y_val = y[train_idx], y[val_idx]
 
-            model = xgb.XGBClassifier(**self.params)
+            fold_params = {**self.params, "early_stopping_rounds": 30}
+            model = xgb.XGBClassifier(**fold_params)
             model.fit(
                 X_train, y_train,
                 eval_set=[(X_val, y_val)],
                 verbose=False,
-                early_stopping_rounds=30,
             )
 
             preds = model.predict(X_val)
