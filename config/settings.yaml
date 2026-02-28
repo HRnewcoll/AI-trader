@@ -1,0 +1,167 @@
+# ── Pairs ─────────────────────────────────────────────
+pairs:
+  majors:
+    - EURUSD
+    - GBPUSD
+    - USDJPY
+    - AUDUSD
+    - USDCAD
+    - NZDUSD
+    - USDCHF
+  emerging:
+    - USDMXN
+    - USDZAR
+    - USDTRY
+    - USDBRL
+
+# ── Timeframes ─────────────────────────────────────────
+timeframes:
+  primary: H4
+  secondary: [H1, D1]
+  scalp: M15
+
+# ── Trading Sessions (UTC) ─────────────────────────────
+sessions:
+  asian:   { start: "00:00", end: "08:00", size_multiplier: 0.5 }
+  london:  { start: "08:00", end: "16:00", size_multiplier: 1.0 }
+  new_york:{ start: "13:00", end: "21:00", size_multiplier: 1.0 }
+  overlap: { start: "13:00", end: "16:00", size_multiplier: 1.5 }
+
+# ── Data Sources ───────────────────────────────────────
+data:
+  broker: oanda            # oanda | mt5 | yfinance
+  historical_fallback: yfinance
+  tick_archive: dukascopy
+  economic_calendar: scrape  # scrape (no API needed)
+  feature_store: redis       # redis | feast | memory
+
+# ── Models ─────────────────────────────────────────────
+models:
+  ensemble_weights_update_hours: 1
+  min_confidence: 0.65
+  walk_forward_train_pct: 0.80
+  retrain_schedule: "0 6 * * 6"   # Saturday 06:00 UTC
+  loss_trigger_dd: 0.05
+  loss_trigger_winrate_drop: 0.15
+  models_dir: artifacts/models
+  onnx_dir: artifacts/onnx
+
+# ── RL ──────────────────────────────────────────────────
+rl:
+  algorithms: [ppo, dqn]
+  total_timesteps: 500000
+  learning_rate: 0.0003
+  gamma: 0.99
+  reward_sharpe_weight: 1.0
+  reward_cost_penalty: 0.001
+  reward_loss_aversion: 2.0
+  reward_session_bonus: 0.1
+  reward_survival_bonus: 0.05
+
+# ── Risk ────────────────────────────────────────────────
+risk:
+  max_risk_per_trade_pct: 0.02
+  kelly_fraction: 0.25
+  max_daily_drawdown_pct: 0.03
+  max_total_drawdown_pct: 0.10
+  circuit_breaker_dd_pct: 0.05
+  survival_mode_equity_pct: 0.70
+  survival_mode_size_mult: 0.1
+  max_correlated_positions: 2
+  correlation_threshold: 0.75
+  monte_carlo_paths: 10000
+  atr_sl_multiplier: 2.0
+  atr_tp_multiplier: 3.0
+
+# ── Sentiment / SENTIENCE ─────────────────────────────
+sentiment:
+  finbert_model: ProsusAI/finbert
+  vader_enabled: true
+  llm_summarizer: local          # local | ollama | openai | none
+  llm_model: llama3              # used if ollama
+  aggregate_window_hours: 4
+  signal_threshold: 0.3
+  # Non-API scrapers (no keys needed)
+  news_sources:
+    - type: rss
+      url: https://feeds.reuters.com/reuters/businessNews
+      name: reuters
+    - type: rss
+      url: https://www.investing.com/rss/news.rss
+      name: investing
+    - type: rss
+      url: https://feeds.a.dj.com/rss/RSSMarketsMain.xml
+      name: wsj
+    - type: rss
+      url: https://rss.cnn.com/rss/money_news_international.rss
+      name: cnn
+    - type: rss
+      url: https://www.forexlive.com/feed/news
+      name: forexlive
+    - type: rss
+      url: https://www.fxstreet.com/rss
+      name: fxstreet
+  reddit_sources:
+    - type: scrape          # no API key — HTML scrape
+      subreddit: forex
+    - type: scrape
+      subreddit: algotrading
+    - type: scrape
+      subreddit: wallstreetbets
+  twitter_sources:
+    - type: nitter          # no API key — nitter instance scrape
+      queries: ["$EURUSD", "$GBPUSD", "forex", "forextrading"]
+
+# ── Genetic Optimizer ─────────────────────────────────
+genetic:
+  population_size: 50
+  generations: 100
+  objectives: [sharpe, sortino, calmar, neg_drawdown]
+  mutation_rate: 0.1
+  crossover_rate: 0.8
+  schedule: "0 8 * * 6"    # Saturday 08:00 UTC
+
+# ── Notifications ─────────────────────────────────────
+notifications:
+  telegram:
+    enabled: true
+    bot_token: "${TELEGRAM_BOT_TOKEN}"
+    chat_id: "${TELEGRAM_CHAT_ID}"
+  slack:
+    enabled: false
+    webhook_url: "${SLACK_WEBHOOK_URL}"
+  email:
+    enabled: false
+    smtp_host: smtp.gmail.com
+    smtp_port: 587
+    user: "${EMAIL_USER}"
+    password: "${EMAIL_PASSWORD}"
+    to: "${EMAIL_TO}"
+
+# ── Monitoring ──────────────────────────────────────────
+monitoring:
+  prometheus_port: 9090
+  grafana_port: 3000
+  watchdog_interval_seconds: 60
+  ks_drift_pvalue_threshold: 0.05
+  anomaly_zscore_threshold: 3.0
+  log_dir: logs/
+
+# ── Execution ──────────────────────────────────────────
+execution:
+  mode: paper              # paper | live
+  broker_api: oanda        # oanda | mt5 | websocket
+  mt5_server: "${MT5_SERVER}"
+  mt5_login: "${MT5_LOGIN}"
+  mt5_password: "${MT5_PASSWORD}"
+  oanda_account: "${OANDA_ACCOUNT_ID}"
+  oanda_token: "${OANDA_API_TOKEN}"
+  max_slippage_pips: 2.0
+  latency_budget_ms: 200
+
+# ── Memory ─────────────────────────────────────────────
+memory:
+  vector_db: chromadb      # chromadb | pinecone
+  chroma_persist_dir: artifacts/chromadb
+  context_window: 100      # last N trades for context
+  embedding_model: all-MiniLM-L6-v2
