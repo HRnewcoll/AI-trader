@@ -117,10 +117,16 @@ class GeneticOptimizer:
     def _setup_deap(self) -> None:
         # Multi-objective: maximise all 4 objectives
         n_obj = len(self.cfg.objectives)
+        weights = tuple([1.0] * n_obj)
 
-        # Avoid duplicate creator entries if called multiple times
+        # Re-create if weights changed (e.g. different objective count)
+        if hasattr(creator, "FitnessMulti"):
+            if getattr(creator.FitnessMulti, "weights", None) != weights:
+                del creator.FitnessMulti
+                if hasattr(creator, "Individual"):
+                    del creator.Individual
         if not hasattr(creator, "FitnessMulti"):
-            creator.create("FitnessMulti", base.Fitness, weights=tuple([1.0] * n_obj))
+            creator.create("FitnessMulti", base.Fitness, weights=weights)
         if not hasattr(creator, "Individual"):
             creator.create("Individual", list, fitness=creator.FitnessMulti)
 

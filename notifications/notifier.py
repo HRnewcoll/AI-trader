@@ -79,7 +79,7 @@ class Notifier:
             f"Confidence: {confidence:.0%}\n"
         )
         if pnl is not None:
-            msg += f"PnL: {'+'if pnl>=0 else ''}{pnl:.2f}\n"
+            msg += f"PnL: {'+' if pnl >= 0 else ''}{pnl:.2f}\n"
         if explanation:
             msg += f"\n📊 {explanation[:300]}"
 
