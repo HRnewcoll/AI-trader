@@ -113,7 +113,9 @@ def main() -> None:
 
     # Load config
     cfg = load_config()
-    pairs = cfg.get("pairs", {}).get("majors", ["EURUSD"])[:3]  # Start with 3 pairs
+    pairs = cfg.get("pairs", {}).get("majors", ["EURUSD"])
+    startup_pairs_limit = cfg.get("startup_pairs_limit", len(pairs))
+    pairs = pairs[:startup_pairs_limit]
 
     # Create artifact dirs
     for d in ["artifacts/models", "artifacts/onnx", "artifacts/chromadb", "logs"]:

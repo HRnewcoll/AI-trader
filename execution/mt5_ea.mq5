@@ -5,9 +5,10 @@
 #property copyright "ForexAI 2026"
 #property strict
 
-input string SignalFile   = "forex_ai_signal.json";
-input double MaxLots      = 1.0;
-input int    MagicNumber  = 20260101;
+input string SignalFile        = "forex_ai_signal.json";
+input double MaxLots           = 1.0;
+input int    MagicNumber       = 20260101;
+input double MinConfidence     = 0.65;
 
 struct SignalData {
    string pair;
@@ -43,7 +44,7 @@ void OnTimer() {
    SignalData sig;
    if (!ParseSignal(json, sig)) return;
 
-   if (sig.confidence < 0.65) {
+   if (sig.confidence < MinConfidence) {
       Print("Low confidence ", sig.confidence, " — skipping signal");
       return;
    }

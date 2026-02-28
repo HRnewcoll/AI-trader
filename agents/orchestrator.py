@@ -227,9 +227,10 @@ class ForexOrchestrator:
         if rl_agent:
             try:
                 feature_cols = get_feature_columns(df)
-                obs_row = df[feature_cols].iloc[-1].fillna(0).values[:rl_agent.models.get("ppo") and 50 or 50]
-                obs = np.array(obs_row[:rl_agent.models.__len__() and 50 or 50], dtype=np.float32)
-                obs = np.pad(obs, (0, max(0, 50 - len(obs))))
+                obs_size = self.cfg.get("rl", {}).get("observation_size", 50)
+                obs_row = df[feature_cols].iloc[-1].fillna(0).values[:obs_size]
+                obs = np.array(obs_row, dtype=np.float32)
+                obs = np.pad(obs, (0, max(0, obs_size - len(obs))))
                 action, confidence = rl_agent.predict(obs)
                 if action == 1:
                     votes[1] += weights.get("rl", 1.0) * confidence
