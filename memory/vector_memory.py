@@ -169,12 +169,14 @@ class TradingMemory:
         n = n or self.context_window
         if self._trade_collection:
             try:
-                results = self._trade_collection.query(
-                    query_embeddings=[self._embed(f"trade {pair}")],
-                    n_results=min(n, self._trade_collection.count() or 1),
-                    where={"pair": pair} if self._trade_collection.count() > 0 else None,
-                )
-                return (results.get("metadatas") or [[]])[0]
+                count = self._trade_collection.count()
+                if count > 0:
+                    results = self._trade_collection.query(
+                        query_embeddings=[self._embed(f"trade {pair}")],
+                        n_results=min(n, count),
+                        where={"pair": pair},
+                    )
+                    return (results.get("metadatas") or [[]])[0]
             except Exception:
                 pass
         return [t["data"] for t in self._mem_trades if t["data"].get("pair") == pair][-n:]

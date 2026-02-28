@@ -41,7 +41,6 @@ class ForexTradingEnv(gym.Env):
         session_bonus: float = 0.1,
         survival_bonus: float = 0.05,
         pip: float = 0.0001,
-        window_size: int = 1,
     ):
         super().__init__()
         self.df = df.reset_index(drop=True)

@@ -110,7 +110,6 @@ class ForexExplainer:
                 logger.debug("SHAP explain error: %s", e)
 
         # LIME
-        lime_text = ""
         if self._lime_explainer is not None:
             try:
                 lime_exp = self._lime_explainer.explain_instance(
