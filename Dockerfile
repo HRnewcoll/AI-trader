@@ -27,8 +27,8 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY . .
 
-# Build Rust extensions
-RUN cd rust_core && cargo build --release 2>/dev/null || echo "Rust build skipped"
+# Build Rust extensions (optional — gracefully skipped if Rust toolchain unavailable)
+RUN cd rust_core && cargo build --release || echo "Rust build skipped — continuing without native extensions"
 
 # Create directories
 RUN mkdir -p logs artifacts/models artifacts/onnx artifacts/chromadb

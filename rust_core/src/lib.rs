@@ -160,8 +160,8 @@ fn evaluate_population_fitness(
                 if downside_std > 0.0 { mean / downside_std * (252f64).sqrt() } else { 0.0 }
             } else { sharpe };
 
-            // Calmar
-            let total_return: f64 = returns.iter().product::<f64>() - 1.0;
+            // Calmar — compound raw returns into total return
+            let total_return: f64 = returns.iter().map(|r| 1.0 + r).product::<f64>() - 1.0;
             let calmar = if max_dd > 0.0 { total_return / max_dd } else { 0.0 };
 
             (sharpe, sortino, calmar)
