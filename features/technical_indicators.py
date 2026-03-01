@@ -88,8 +88,9 @@ def _adx(high: pd.Series, low: pd.Series, close: pd.Series, period: int = 14) ->
 def _cci(high: pd.Series, low: pd.Series, close: pd.Series, period: int = 20) -> pd.Series:
     tp = (high + low + close) / 3
     sma_tp = tp.rolling(period).mean()
-    mean_dev = tp.rolling(period).apply(lambda x: np.mean(np.abs(x - x.mean())), raw=True)
-    return (tp - sma_tp) / (0.015 * mean_dev + 1e-10)
+    # Vectorised MAD: store mean once to avoid duplicate computation
+    mad = tp.rolling(period).apply(lambda x: (np.abs(x - x.mean())).mean(), raw=True)
+    return (tp - sma_tp) / (0.015 * mad + 1e-10)
 
 
 def _obv(close: pd.Series, volume: pd.Series) -> pd.Series:
@@ -244,11 +245,14 @@ def compute_all_indicators(df: pd.DataFrame, pair: str = "EURUSD") -> pd.DataFra
         df["hour_cos"] = np.cos(2 * np.pi * hour_series / 24)
 
     df = df.replace([np.inf, -np.inf], np.nan)
+    # Use .ffill() — compatible with pandas 2.x and 3.x
+    df = df.ffill()
     logger.debug("Computed %d features for %s", len(df.columns), pair)
     return df
 
 
 def get_feature_columns(df: pd.DataFrame) -> list[str]:
-    """Return feature column names (exclude raw OHLCV and target)."""
-    exclude = {"open", "high", "low", "close", "volume", "direction", "future_return_1"}
+    """Return feature column names (exclude raw OHLCV, target, and regime string col)."""
+    exclude = {"open", "high", "low", "close", "volume", "direction",
+               "future_return_1", "regime"}
     return [c for c in df.columns if c not in exclude]

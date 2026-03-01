@@ -204,8 +204,14 @@ class TransformerTrainer:
         split = int(len(X_t) * (1 - val_split))
         train_ds = TensorDataset(X_t[:split], y_t[:split])
         val_ds = TensorDataset(X_t[split:], y_t[split:])
-        train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=False)
-        val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False)
+        # pin_memory speeds up GPU transfers; use parallel data loading if multiple threads available
+        _pin = self.device.type == "cuda"
+        _MIN_THREADS_FOR_WORKERS = 2
+        _workers = _MIN_THREADS_FOR_WORKERS if torch.get_num_threads() > _MIN_THREADS_FOR_WORKERS else 0
+        train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=False,
+                                  pin_memory=_pin, num_workers=_workers)
+        val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False,
+                                pin_memory=_pin, num_workers=_workers)
 
         self.model = self._build_model().to(self.device)
         optimizer = torch.optim.AdamW(self.model.parameters(), lr=lr, weight_decay=1e-4)

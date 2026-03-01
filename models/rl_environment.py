@@ -66,6 +66,12 @@ class ForexTradingEnv(gym.Env):
             low=-10.0, high=10.0, shape=(obs_size,), dtype=np.float32
         )
 
+        # Pre-compute feature matrix for fast step() access (avoids per-row dict lookup)
+        valid_cols = [c for c in feature_cols if c in df.columns]
+        self._feature_matrix = (
+            df[valid_cols].ffill().fillna(0.0).values.astype(np.float32)
+        )
+
         self._reset_state()
 
     def _reset_state(self) -> None:
@@ -87,21 +93,13 @@ class ForexTradingEnv(gym.Env):
         return obs, {}
 
     def _get_observation(self) -> np.ndarray:
-        row = self.df.iloc[self.current_step]
-        features = []
-        for col in self.feature_cols:
-            val = row.get(col, 0.0)
-            if pd.isna(val) or np.isinf(val):
-                val = 0.0
-            features.append(float(val))
+        # Use pre-computed matrix — O(1) lookup vs per-row dict scan
+        features_arr = np.clip(self._feature_matrix[self.current_step], -10, 10)
 
-        # Normalize features to [-3, 3]
-        features_arr = np.clip(np.array(features, dtype=np.float32), -10, 10)
-
-        # Portfolio state features
+        # Portfolio state features (use df row for current price)
+        current_price = float(self.df.at[self.current_step, "close"]) if "close" in self.df.columns else 0.0
         equity_pct = (self.equity / self.initial_equity) - 1.0
         drawdown = (self.peak_equity - self.equity) / (self.peak_equity + 1e-8)
-        current_price = float(row.get("close", 0.0))
         unrealized_pnl = 0.0
         if self.position != 0.0 and self.entry_price > 0:
             unrealized_pnl = (current_price - self.entry_price) * self.position / (current_price + 1e-8)

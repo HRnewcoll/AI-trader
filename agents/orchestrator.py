@@ -1,14 +1,16 @@
 """
 Central multi-agent orchestrator.
-Coordinates: Technical, Sentiment, Risk, and RL agents.
+Coordinates: Technical, Sentiment, Correlation, RL agents + LLM Orchestrator.
 Produces final trade signal as structured JSON with XAI explanation.
 Sends signal to MT5 bridge + notifications.
+Processes all pairs concurrently for speed.
 """
 from __future__ import annotations
 
 import json
 import logging
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
@@ -21,7 +23,12 @@ from data_pipeline.news_scraper import fetch_rss_feeds
 from data_pipeline.reddit_scraper import fetch_reddit_posts
 from data_pipeline.twitter_scraper import fetch_tweets
 from features.technical_indicators import compute_all_indicators, get_feature_columns
+from features.candle_patterns import compute_candle_features
+from features.regime_detector import detect_regime
 from agents.sentiment_agent import SentimentAgent
+from agents.technical_agent import TechnicalAgent
+from agents.correlation_agent import CorrelationAgent
+from agents.llm_orchestrator import LLMOrchestrator
 from risk_healing.risk_manager import RiskManager, RiskConfig
 from risk_healing.self_healer import SelfHealer
 from notifications.notifier import Notifier, build_notifier_from_cfg
@@ -65,6 +72,19 @@ class ForexOrchestrator:
         self.sentiment_agent = SentimentAgent(
             finbert_model=cfg.get("sentiment", {}).get("finbert_model", "ProsusAI/finbert"),
             aggregate_window_hours=cfg.get("sentiment", {}).get("aggregate_window_hours", 4),
+        )
+        self.technical_agent = TechnicalAgent(
+            rsi_oversold=cfg.get("technical_agent", {}).get("rsi_oversold", 30.0),
+            rsi_overbought=cfg.get("technical_agent", {}).get("rsi_overbought", 70.0),
+            adx_trend_threshold=cfg.get("technical_agent", {}).get("adx_trend_threshold", 25.0),
+        )
+        self.correlation_agent = CorrelationAgent(
+            max_correlation=cfg.get("risk", {}).get("max_correlation", 0.75),
+        )
+        self.llm_orchestrator = LLMOrchestrator(
+            backend=cfg.get("llm", {}).get("backend", "auto"),
+            ollama_host=cfg.get("llm", {}).get("ollama_host", "http://localhost:11434"),
+            sentiment_threshold=cfg.get("sentiment", {}).get("signal_threshold", 0.3),
         )
         self.risk_manager = RiskManager(
             initial_equity=10_000.0,
@@ -265,6 +285,7 @@ class ForexOrchestrator:
             if df.empty or len(df) < 100:
                 return None
             df = compute_all_indicators(df, pair)
+            df = compute_candle_features(df)   # add candle patterns
             self._df_cache[pair] = df
             feature_cols = get_feature_columns(df)
             if not self._feature_cols:
@@ -288,6 +309,35 @@ class ForexOrchestrator:
             return None
 
         direction, confidence = self._get_ensemble_signal(pair, df)
+
+        # 4b. Technical agent signal
+        ta_signal = self.technical_agent.analyse(df)
+
+        # 4c. Correlation check
+        corr_allowed, corr_reason = self.correlation_agent.can_open_position(
+            pair, direction
+        )
+        corr_result = {"allowed": corr_allowed, "reason": corr_reason}
+
+        # 4d. Regime
+        regime_state = detect_regime(df)
+
+        # 4e. LLM orchestrator — final reasoning
+        rl_signal = {"action": 1 if direction == 1 else (2 if direction == -1 else 0),
+                     "confidence": confidence}
+        llm_decision = self.llm_orchestrator.decide(
+            pair=pair,
+            technical_signal=ta_signal,
+            sentiment_score=sentiment_score,
+            rl_signal=rl_signal,
+            correlation_result=corr_result,
+            risk_ok=True,
+            regime=regime_state.regime.value,
+        )
+        # Let LLM override direction if confidence higher
+        if llm_decision["confidence"] > confidence * 1.05:
+            direction = llm_decision["direction"]
+            confidence = llm_decision["confidence"]
 
         # 5. Confidence filter
         min_conf = self.cfg.get("models", {}).get("min_confidence", 0.65)
@@ -397,19 +447,30 @@ class ForexOrchestrator:
             pass
 
     def run_cycle(self) -> list[dict]:
-        """Run one complete signal cycle for all pairs."""
+        """Run one complete signal cycle for all pairs — concurrently."""
         trades = []
         health = self.healer.run_health_check(equity=self.broker.get_account_equity())
         self.metrics.set_circuit_breaker(self.risk_manager.is_circuit_broken)
         self.metrics.set_survival_mode(self.risk_manager.is_survival_mode)
 
-        for pair in self.pairs:
-            try:
-                trade = self.process_pair(pair)
-                if trade:
-                    trades.append(trade)
-            except Exception as e:
-                logger.error("Pair %s cycle error: %s", pair, e)
+        # Update correlation matrix from cached price data
+        if self._df_cache:
+            self.correlation_agent.update_correlation_matrix(self._df_cache)
+
+        max_workers = min(len(self.pairs), 4)   # cap threads to avoid API rate limits
+        with ThreadPoolExecutor(max_workers=max_workers) as pool:
+            future_to_pair = {
+                pool.submit(self.process_pair, pair): pair
+                for pair in self.pairs
+            }
+            for future in as_completed(future_to_pair):
+                pair = future_to_pair[future]
+                try:
+                    trade = future.result()
+                    if trade:
+                        trades.append(trade)
+                except Exception as e:
+                    logger.error("Pair %s cycle error: %s", pair, e)
 
         return trades
 

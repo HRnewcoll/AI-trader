@@ -55,9 +55,10 @@ class XGBoostForexModel:
         "reg_lambda": 1.0,
         "scale_pos_weight": 1.0,
         "random_state": 42,
-        "n_jobs": -1,
-        "tree_method": "hist",
-        "device": "cpu",
+        "n_jobs": -1,           # use all CPU cores
+        "tree_method": "hist",  # fastest CPU method; auto-upgrades to 'gpu_hist' if CUDA available
+        "device": "cpu",        # set to "cuda" if GPU is available
+        "early_stopping_rounds": 30,
     }
 
     def __init__(self, params: dict | None = None, artifacts_dir: str = "artifacts/models"):
@@ -113,8 +114,10 @@ class XGBoostForexModel:
             X_train, X_val = X[train_idx], X[val_idx]
             y_train, y_val = y[train_idx], y[val_idx]
 
-            fold_params = {**self.params, "early_stopping_rounds": 30}
-            model = xgb.XGBClassifier(**fold_params)
+            # early_stopping_rounds lives in the constructor params (XGBoost 2.x+)
+            _esr = self.params.get("early_stopping_rounds", 30)
+            fold_params = {k: v for k, v in self.params.items() if k != "early_stopping_rounds"}
+            model = xgb.XGBClassifier(**fold_params, early_stopping_rounds=_esr)
             model.fit(
                 X_train, y_train,
                 eval_set=[(X_val, y_val)],
@@ -131,8 +134,9 @@ class XGBoostForexModel:
             cv_scores.append({"fold": fold, "accuracy": acc, "auc": auc})
             logger.info("Fold %d — accuracy: %.3f, AUC: %.3f", fold, acc, auc)
 
-        # Final training on full dataset
-        self.model = xgb.XGBClassifier(**self.params)
+        # Final training on full dataset (no early stopping — use all estimators)
+        final_params = {k: v for k, v in self.params.items() if k != "early_stopping_rounds"}
+        self.model = xgb.XGBClassifier(**final_params)
         self.model.fit(X, y, verbose=False)
 
         self.is_trained = True

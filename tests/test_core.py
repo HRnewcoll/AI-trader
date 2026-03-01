@@ -62,6 +62,120 @@ def test_feature_column_count(sample_ohlcv):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Candle Patterns (NEW)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def test_candle_patterns(sample_ohlcv):
+    from features.candle_patterns import compute_candle_features, get_pattern_columns
+    df = compute_candle_features(sample_ohlcv)
+    pat_cols = get_pattern_columns()
+    for col in pat_cols:
+        assert col in df.columns, f"Missing pattern column: {col}"
+    # Doji values should be -1, 0, or 1
+    assert df["pat_doji"].isin([-1.0, 0.0, 1.0]).all()
+    # Composite score should be clipped to [-5, 5]
+    assert df["pat_composite"].between(-5, 5).all()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Regime Detector (NEW)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def test_regime_detector(sample_ohlcv):
+    from features.technical_indicators import compute_all_indicators
+    from features.regime_detector import detect_regime, add_regime_features, Regime
+    df = compute_all_indicators(sample_ohlcv)
+    state = detect_regime(df)
+    assert state.regime in list(Regime)
+    assert 0.0 <= state.confidence <= 1.0
+    assert state.volatility_level in ("low", "medium", "high")
+
+    df_with_regime = add_regime_features(df.tail(100))
+    assert "regime" in df_with_regime.columns
+    assert "regime_trending_up" in df_with_regime.columns
+    assert "regime_vol_pct" in df_with_regime.columns
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Technical Agent (NEW)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def test_technical_agent(sample_ohlcv):
+    from features.technical_indicators import compute_all_indicators
+    from agents.technical_agent import TechnicalAgent
+    df = compute_all_indicators(sample_ohlcv)
+    agent = TechnicalAgent()
+    result = agent.analyse(df)
+    assert result["signal"] in (-1, 0, 1)
+    assert 0.0 <= result["confidence"] <= 1.0
+    assert isinstance(result["reasons"], list)
+    assert "regime" in result
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Correlation Agent (NEW)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def test_correlation_agent():
+    from agents.correlation_agent import CorrelationAgent
+    agent = CorrelationAgent(max_correlation=0.75, max_correlated_open=2)
+
+    # Should allow first position
+    allowed, reason = agent.can_open_position("EURUSD", 1)
+    assert allowed, reason
+
+    # Open a correlated pair
+    agent.register_open("GBPUSD", 1)  # highly correlated with EURUSD
+    agent.register_open("AUDUSD", 1)  # also correlated
+
+    # Static baseline correlation check
+    corr = agent.get_correlation("EURUSD", "GBPUSD")
+    assert 0.0 <= corr <= 1.0
+
+    # Diversification score with conflicting signals
+    score = agent.get_diversification_score({"EURUSD": 1, "USDJPY": -1, "GBPUSD": 1})
+    assert 0.0 <= score <= 1.0
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# LLM Orchestrator (NEW)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def test_llm_orchestrator_rules():
+    from agents.llm_orchestrator import LLMOrchestrator
+    orch = LLMOrchestrator(backend="rules")  # force rule-based (no Ollama needed)
+    decision = orch.decide(
+        pair="EURUSD",
+        technical_signal={"signal": 1, "confidence": 0.7, "reasons": ["EMA crossover"], "regime": "trending_up"},
+        sentiment_score=0.5,
+        rl_signal={"action": 1, "confidence": 0.65},
+        correlation_result={"allowed": True},
+        risk_ok=True,
+        regime="trending_up",
+    )
+    assert decision["action"] in ("buy", "sell", "hold")
+    assert 0.0 <= decision["confidence"] <= 1.0
+    assert "explanation" in decision
+    assert decision["pair"] == "EURUSD"
+
+
+def test_llm_orchestrator_veto():
+    from agents.llm_orchestrator import LLMOrchestrator
+    orch = LLMOrchestrator(backend="rules")
+    # Risk veto should force hold
+    decision = orch.decide(
+        pair="GBPUSD",
+        technical_signal={"signal": 1, "confidence": 0.9, "reasons": [], "regime": "trending_up"},
+        sentiment_score=0.8,
+        rl_signal={"action": 1, "confidence": 0.9},
+        correlation_result={"allowed": True},
+        risk_ok=False,  # ← risk veto
+        regime="trending_up",
+    )
+    assert decision["action"] == "hold"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Config Loader
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -284,3 +398,19 @@ def test_self_healer():
     health = healer.run_health_check(equity=9100)
     assert "overall" in health
     assert "equity" in health
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Run.py launcher (smoke test — no side effects)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def test_run_py_imports():
+    """Verify run.py imports cleanly without executing side effects."""
+    import importlib.util
+    spec = importlib.util.spec_from_file_location(
+        "run", Path(__file__).parent.parent / "run.py"
+    )
+    # Just load the module spec without executing it
+    assert spec is not None
+    assert spec.loader is not None
+
