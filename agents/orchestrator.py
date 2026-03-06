@@ -22,9 +22,11 @@ from data_pipeline.market_data import fetch_ohlcv
 from data_pipeline.news_scraper import fetch_rss_feeds
 from data_pipeline.reddit_scraper import fetch_reddit_posts
 from data_pipeline.twitter_scraper import fetch_tweets
+from data_pipeline.economic_calendar import is_high_impact_window
 from features.technical_indicators import compute_all_indicators, get_feature_columns
 from features.candle_patterns import compute_candle_features
 from features.regime_detector import detect_regime
+from features.multi_timeframe import MultiTimeframeAnalyser
 from agents.sentiment_agent import SentimentAgent
 from agents.technical_agent import TechnicalAgent
 from agents.correlation_agent import CorrelationAgent
@@ -34,6 +36,7 @@ from risk_healing.self_healer import SelfHealer
 from notifications.notifier import Notifier, build_notifier_from_cfg
 from monitoring.metrics_server import MetricsServer
 from memory.vector_memory import TradingMemory
+from utils.trade_journal import TradeJournal
 from xai.explainer import ForexExplainer
 
 logger = logging.getLogger(__name__)
@@ -96,6 +99,12 @@ class ForexOrchestrator:
         )
         self.memory = TradingMemory(
             persist_dir=cfg.get("memory", {}).get("chroma_persist_dir", "artifacts/chromadb"),
+        )
+        self.journal = TradeJournal(
+            journal_dir=cfg.get("memory", {}).get("journal_dir", "artifacts/trade_journal"),
+        )
+        self.mtf_analyser = MultiTimeframeAnalyser(
+            timeframes=cfg.get("timeframes", {}).get("mtf", ["M15", "H1", "H4", "D1"]),
         )
         self.healer = SelfHealer(
             artifacts_dir=cfg.get("models", {}).get("models_dir", "artifacts/models"),
@@ -279,6 +288,14 @@ class ForexOrchestrator:
             logger.info("Risk block for %s: %s", pair, reason)
             return None
 
+        # 1b. Economic calendar — skip trading 15 min before/after high-impact events
+        try:
+            if is_high_impact_window(pair, minutes_before=15, minutes_after=15):
+                logger.info("%s: High-impact news window — skipping trade", pair)
+                return None
+        except Exception as e:
+            logger.debug("Economic calendar check error: %s", e)
+
         # 2. Fetch + compute features
         try:
             df = fetch_ohlcv(pair, self.timeframe, bars=500, cfg=self.cfg)
@@ -321,6 +338,16 @@ class ForexOrchestrator:
 
         # 4d. Regime
         regime_state = detect_regime(df)
+
+        # 4e. Multi-timeframe confluence
+        mtf_result = self.mtf_analyser.analyse(pair, cfg=self.cfg)
+        mtf_allowed, mtf_reason = self.mtf_analyser.filter_signal(
+            pair, direction, mtf_result
+        )
+        if not mtf_allowed:
+            logger.info("%s: MTF block — %s", pair, mtf_reason)
+            return None
+        logger.debug("%s MTF: %s", pair, mtf_reason)
 
         # 4e. LLM orchestrator — final reasoning
         rl_signal = {"action": 1 if direction == 1 else (2 if direction == -1 else 0),
@@ -413,8 +440,9 @@ class ForexOrchestrator:
             logger.error("Order placement error: %s", e)
             return None
 
-        # 12. Memory + metrics + notify
+        # 12. Memory + journal + metrics + notify
         self.memory.store_trade(trade)
+        self.journal.record_open(trade)
         self.metrics.update_trade(pair, trade["direction"], 0.0)
         self.notifier.send_trade(trade, explanation_text)
         self._trade_count += 1
@@ -431,7 +459,6 @@ class ForexOrchestrator:
 
     def _write_mt5_signal(self, trade: dict) -> None:
         """Write signal JSON for MT5 EA to pick up."""
-        import json as _json
         signal = {
             "pair": trade["pair"],
             "direction": 1 if trade["direction"] == "buy" else -1,
@@ -442,7 +469,7 @@ class ForexOrchestrator:
         }
         try:
             signal_path = Path("forex_ai_signal.json")
-            signal_path.write_text(_json.dumps(signal))
+            signal_path.write_text(json.dumps(signal))
         except Exception:
             pass
 
@@ -472,7 +499,41 @@ class ForexOrchestrator:
                 except Exception as e:
                     logger.error("Pair %s cycle error: %s", pair, e)
 
+        # Persist MTF status and journal snapshot for dashboard
+        self._save_mtf_status()
+        self._save_journal_snapshot()
+
         return trades
+
+    def _save_mtf_status(self) -> None:
+        """Write per-pair MTF results to logs/mtf_status.json for the dashboard."""
+        try:
+            log_dir = Path("logs")
+            log_dir.mkdir(exist_ok=True)
+            results = {}
+            for pair in self.pairs:
+                try:
+                    r = self.mtf_analyser.analyse(pair, cfg=self.cfg)
+                    results[pair] = {
+                        "confluence_score": r.confluence_score,
+                        "agreed_direction": r.agreed_direction,
+                        "bias": r.bias,
+                        "strength": r.strength,
+                        "n_aligned": r.n_aligned,
+                        "n_total": r.n_total,
+                    }
+                except Exception:
+                    pass
+            (log_dir / "mtf_status.json").write_text(json.dumps(results))
+        except Exception as e:
+            logger.debug("MTF status save error: %s", e)
+
+    def _save_journal_snapshot(self) -> None:
+        """Save a JSON snapshot of the trade journal for the dashboard."""
+        try:
+            self.journal.save_json_snapshot()
+        except Exception as e:
+            logger.debug("Journal snapshot error: %s", e)
 
     def update_ensemble_weights(self) -> None:
         """Update model weights based on recent PnL (called hourly)."""

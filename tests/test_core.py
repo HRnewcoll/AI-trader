@@ -414,3 +414,240 @@ def test_run_py_imports():
     assert spec is not None
     assert spec.loader is not None
 
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Performance Analytics (NEW)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def test_performance_analytics_basic():
+    from utils.performance_analytics import compute_metrics, TradingMetrics
+    pnl = [50, -30, 80, -20, 60, 90, -40, 30, -10, 70]
+    m = compute_metrics(pnl, initial_equity=10_000.0)
+    assert isinstance(m, TradingMetrics)
+    assert m.n_trades == 10
+    assert m.total_pnl == pytest.approx(sum(pnl))
+    assert 0.0 <= m.win_rate <= 1.0
+    assert m.profit_factor >= 0.0
+    assert m.max_drawdown_pct >= 0.0
+
+
+def test_performance_analytics_empty():
+    from utils.performance_analytics import compute_metrics
+    m = compute_metrics([])
+    assert m.n_trades == 0
+    assert m.sharpe_ratio == 0.0
+
+
+def test_performance_analytics_all_wins():
+    from utils.performance_analytics import compute_metrics
+    pnl = [10.0] * 20
+    m = compute_metrics(pnl)
+    assert m.win_rate == pytest.approx(1.0)
+    assert m.max_consecutive_wins == 20
+    assert m.max_consecutive_losses == 0
+    assert m.profit_factor > 0
+
+
+def test_performance_analytics_equity_series():
+    from utils.performance_analytics import equity_series_from_pnl
+    eq = equity_series_from_pnl([100, -50, 200], initial_equity=10_000.0)
+    assert float(eq.iloc[0]) == pytest.approx(10_000.0)
+    assert float(eq.iloc[-1]) == pytest.approx(10_250.0)
+
+
+def test_performance_analytics_rolling_sharpe():
+    from utils.performance_analytics import rolling_sharpe
+    pnl = list(np.random.normal(10, 5, 50))
+    rs = rolling_sharpe(pnl, window=10)
+    assert len(rs) == 50
+    # Values beyond the window should be non-zero
+    assert rs.iloc[-1] != 0
+
+
+def test_performance_analytics_compare_periods():
+    from utils.performance_analytics import compare_periods
+    before = [10, -5, 8, -3, 12]
+    after  = [15, -4, 20, -2, 18]
+    result = compare_periods(before, after)
+    assert "before" in result
+    assert "after" in result
+    assert "delta" in result
+    # After period has better PnL — delta total_pnl should be positive
+    assert result["delta"]["total_pnl"] > 0
+
+
+def test_performance_analytics_metrics_to_dict():
+    from utils.performance_analytics import compute_metrics, metrics_to_dict
+    m = compute_metrics([10, -5, 8], initial_equity=1000.0)
+    d = metrics_to_dict(m)
+    assert isinstance(d, dict)
+    assert "sharpe_ratio" in d
+    assert "win_rate" in d
+    assert "max_drawdown_pct" in d
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Trade Journal (NEW)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def test_trade_journal_record_open_close(tmp_path):
+    from utils.trade_journal import TradeJournal
+    journal = TradeJournal(journal_dir=tmp_path)
+
+    trade = {
+        "pair": "EURUSD", "direction": "buy",
+        "entry_price": 1.1000, "stop_loss": 1.0950,
+        "take_profit": 1.1100, "size_lots": 0.1,
+        "confidence": 0.72, "sentiment_score": 0.3,
+    }
+    tid = journal.record_open(trade)
+    assert tid == 1
+
+    # Before close — exit_price should be empty
+    df = journal.get_open_trades()
+    assert len(df) == 1
+    assert df.iloc[0]["pair"] == "EURUSD"
+
+    journal.record_close(tid, exit_price=1.1080, pnl=80.0, hold_bars=12, exit_reason="tp_hit")
+
+    closed = journal.get_closed_trades()
+    assert len(closed) == 1
+    assert float(closed.iloc[0]["pnl"]) == pytest.approx(80.0)
+    assert int(closed.iloc[0]["hold_bars"]) == 12
+
+
+def test_trade_journal_summary(tmp_path):
+    from utils.trade_journal import TradeJournal
+    journal = TradeJournal(journal_dir=tmp_path)
+
+    for i, pnl in enumerate([50, -30, 80, -20, 60]):
+        tid = journal.record_open({"pair": "EURUSD", "direction": "buy",
+                                    "entry_price": 1.10 + i * 0.001})
+        journal.record_close(tid, exit_price=1.10 + 0.002, pnl=float(pnl))
+
+    s = journal.summary()
+    assert s["n_trades"] == 5
+    assert s["total_pnl"] == pytest.approx(140.0)
+    assert s["win_rate_pct"] == pytest.approx(60.0)
+
+
+def test_trade_journal_pair_breakdown(tmp_path):
+    from utils.trade_journal import TradeJournal
+    journal = TradeJournal(journal_dir=tmp_path)
+
+    for pair, pnl in [("EURUSD", 50), ("GBPUSD", -30), ("EURUSD", 80), ("GBPUSD", 40)]:
+        tid = journal.record_open({"pair": pair, "direction": "buy", "entry_price": 1.1})
+        journal.record_close(tid, exit_price=1.102, pnl=float(pnl))
+
+    pb = journal.pair_breakdown()
+    assert "EURUSD" in pb["pair"].values
+    assert "GBPUSD" in pb["pair"].values
+    eur = pb[pb["pair"] == "EURUSD"].iloc[0]
+    assert float(eur["total_pnl"]) == pytest.approx(130.0)
+
+
+def test_trade_journal_csv_export(tmp_path):
+    from utils.trade_journal import TradeJournal
+    journal = TradeJournal(journal_dir=tmp_path)
+    tid = journal.record_open({"pair": "USDJPY", "direction": "sell", "entry_price": 149.5})
+    journal.record_close(tid, 149.0, pnl=50.0)
+
+    out = journal.export_csv(tmp_path / "out.csv")
+    assert out.exists()
+    df = pd.read_csv(out)
+    assert "pair" in df.columns
+    assert len(df) == 1
+
+
+def test_trade_journal_json_snapshot(tmp_path):
+    from utils.trade_journal import TradeJournal
+    journal = TradeJournal(journal_dir=tmp_path)
+    tid = journal.record_open({"pair": "AUDUSD", "direction": "buy", "entry_price": 0.65})
+    journal.record_close(tid, 0.652, pnl=20.0)
+
+    snap = journal.save_json_snapshot()
+    assert snap.exists()
+    import json
+    data = json.loads(snap.read_text())
+    assert "summary" in data
+    assert "pair_breakdown" in data
+    assert "open_trades" in data
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Multi-Timeframe Analyser (NEW)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def test_mtf_detect_bias(sample_ohlcv):
+    from features.technical_indicators import compute_all_indicators
+    from features.multi_timeframe import _detect_bias
+    df = compute_all_indicators(sample_ohlcv)
+    direction, strength = _detect_bias(df)
+    assert direction in (-1, 0, 1)
+    assert 0.0 <= strength <= 1.0
+
+
+def test_mtf_analyse_preloaded(sample_ohlcv):
+    from features.technical_indicators import compute_all_indicators
+    from features.multi_timeframe import MultiTimeframeAnalyser
+    df = compute_all_indicators(sample_ohlcv)
+    analyser = MultiTimeframeAnalyser(timeframes=["H1", "H4", "D1"])
+
+    # Pass same df as all timeframes (preloaded)
+    result = analyser.analyse("EURUSD", preloaded={"H1": df, "H4": df, "D1": df})
+    assert result.pair == "EURUSD"
+    assert result.agreed_direction in (-1, 0, 1)
+    assert -1.0 <= result.confluence_score <= 1.0
+    assert 0.0 <= result.confidence <= 1.0
+    assert set(result.bias.keys()) == {"H1", "H4", "D1"}
+
+
+def test_mtf_filter_signal_aligned(sample_ohlcv):
+    from features.technical_indicators import compute_all_indicators
+    from features.multi_timeframe import MultiTimeframeAnalyser
+    df = compute_all_indicators(sample_ohlcv)
+    analyser = MultiTimeframeAnalyser(timeframes=["H1", "H4"])
+
+    result = analyser.analyse("EURUSD", preloaded={"H1": df, "H4": df})
+    # Test that filter_signal returns bool + str
+    allowed, reason = analyser.filter_signal("EURUSD", result.agreed_direction, result)
+    assert isinstance(allowed, bool)
+    assert isinstance(reason, str)
+
+
+def test_mtf_filter_signal_blocks_opposing(sample_ohlcv):
+    from features.technical_indicators import compute_all_indicators
+    from features.multi_timeframe import MultiTimeframeAnalyser, MTFResult
+    df = compute_all_indicators(sample_ohlcv)
+    analyser = MultiTimeframeAnalyser(timeframes=["H1", "H4"])
+
+    # Manufacture a strongly bearish MTFResult
+    mock_result = MTFResult(
+        pair="EURUSD",
+        bias={"H1": -1, "H4": -1},
+        strength={"H1": 0.9, "H4": 0.9},
+        confluence_score=-0.9,
+        agreed_direction=-1,
+        n_aligned=2,
+        n_total=2,
+    )
+    # Propose a BUY against the strong downtrend — should be blocked
+    allowed, reason = analyser.filter_signal("EURUSD", 1, mock_result)
+    assert not allowed
+    assert "block" in reason.lower() or "disagree" in reason.lower() or "MTF" in reason
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Economic Calendar — is_high_impact_window (NEW)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def test_is_high_impact_window_no_data():
+    """Should return False (never block) when calendar can't be fetched."""
+    pytest.importorskip("bs4", reason="beautifulsoup4 not installed")
+    from data_pipeline.economic_calendar import is_high_impact_window
+    # With a fresh empty cache and no network in CI, must return False
+    import data_pipeline.economic_calendar as ec
+    ec._calendar_cache = (0.0, pd.DataFrame())  # force empty cache
+    result = is_high_impact_window("EURUSD", minutes_before=15, minutes_after=15)
+    assert result is False   # fail-safe: never block on data error
+

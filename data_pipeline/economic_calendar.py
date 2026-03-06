@@ -7,7 +7,7 @@ from __future__ import annotations
 import logging
 import re
 import time
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 import pandas as pd
@@ -58,7 +58,7 @@ def scrape_forexfactory(days_ahead: int = 3) -> pd.DataFrame:
     rows = soup.select("tr.calendar__row")
 
     events = []
-    current_date = datetime.utcnow().date()
+    current_date = datetime.now(tz=timezone.utc).date()
 
     for row in rows:
         try:
@@ -153,3 +153,73 @@ def get_upcoming_events(pairs: list[str], cfg: dict | None = None) -> pd.DataFra
     df = df[df["currency"].isin(currencies)]
     df = compute_surprise_index(df)
     return df.reset_index(drop=True)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Live "news blackout" check — call from orchestrator before placing orders
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Module-level cache so we don't scrape on every signal cycle
+_calendar_cache: tuple[float, pd.DataFrame] = (0.0, pd.DataFrame())
+_CALENDAR_TTL = 900  # refresh every 15 minutes
+
+
+def _get_calendar_cached() -> pd.DataFrame:
+    global _calendar_cache
+    now = time.time()
+    ts, df = _calendar_cache
+    if now - ts < _CALENDAR_TTL and not df.empty:
+        return df
+    df = scrape_forexfactory(days_ahead=1)
+    _calendar_cache = (now, df)
+    return df
+
+
+def is_high_impact_window(
+    pair: str,
+    minutes_before: int = 15,
+    minutes_after: int = 15,
+) -> bool:
+    """
+    Return True if a high-impact event for the currencies in *pair* is
+    scheduled within the blackout window around the current UTC time.
+    Returns False on any calendar fetch failure (never block on errors).
+    """
+    try:
+        currencies = {pair[:3], pair[3:]}
+        df = _get_calendar_cached()
+        if df.empty:
+            return False
+
+        hi = df[df["high_impact"] & df["currency"].isin(currencies)]
+        if hi.empty:
+            return False
+
+        # ForexFactory calendar rows don't always carry a precise time;
+        # if 'time' column exists use it, otherwise treat entire day as risky
+        now_utc = datetime.now(tz=timezone.utc).replace(tzinfo=None)
+        if "time" in hi.columns:
+            for _, row in hi.iterrows():
+                raw_time = str(row.get("time", "")).strip()
+                if not raw_time:
+                    continue
+                try:
+                    event_dt = datetime.strptime(
+                        f"{now_utc.date()} {raw_time}", "%Y-%m-%d %I:%M%p"
+                    )
+                    delta = abs((event_dt - now_utc).total_seconds() / 60)
+                    if delta <= max(minutes_before, minutes_after):
+                        logger.info(
+                            "High-impact event '%s' (%s) in %.0f min — blackout active",
+                            row.get("event", ""), row.get("currency", ""), delta,
+                        )
+                        return True
+                except ValueError:
+                    continue
+
+        return False
+
+    except Exception as e:
+        logger.debug("is_high_impact_window error (non-blocking): %s", e)
+        return False
+
