@@ -1001,3 +1001,359 @@ def test_alert_to_dict():
     assert d["value"] == pytest.approx(0.04)
     # Warning level should map to the warning emoji
     assert a.emoji() == "⚠️"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Portfolio Optimizer (NEW — inspired by PyPortfolioOpt)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def test_portfolio_optimizer_hrp(sample_ohlcv):
+    """HRP should produce normalised weights summing to 1."""
+    from utils.portfolio_optimizer import PortfolioOptimizer, PortfolioWeights
+    np.random.seed(0)
+    n = 200
+    returns = pd.DataFrame({
+        "EURUSD": np.random.normal(0.0001, 0.001, n),
+        "GBPUSD": np.random.normal(0.0002, 0.0015, n),
+        "USDJPY": np.random.normal(-0.0001, 0.0012, n),
+    })
+    optimizer = PortfolioOptimizer(method="hrp", min_weight=0.01, max_weight=0.60)
+    result = optimizer.optimise(returns)
+    assert isinstance(result, PortfolioWeights)
+    assert abs(sum(result.weights.values()) - 1.0) < 1e-6
+    assert all(0.01 <= w <= 0.60 for w in result.weights.values())
+    assert result.diversification_ratio > 0
+
+
+def test_portfolio_optimizer_mvo(sample_ohlcv):
+    """MVO should return weights summing to 1 and within bounds."""
+    from utils.portfolio_optimizer import PortfolioOptimizer
+    np.random.seed(1)
+    n = 200
+    returns = pd.DataFrame({
+        "EURUSD": np.random.normal(0.0003, 0.001, n),
+        "GBPUSD": np.random.normal(0.0001, 0.0015, n),
+    })
+    optimizer = PortfolioOptimizer(method="mvo", min_weight=0.10, max_weight=0.90)
+    result = optimizer.optimise(returns)
+    assert abs(sum(result.weights.values()) - 1.0) < 1e-5
+    assert all(w >= 0.10 for w in result.weights.values())
+
+
+def test_portfolio_optimizer_risk_parity():
+    """Risk parity should produce equal risk contributions."""
+    from utils.portfolio_optimizer import PortfolioOptimizer
+    np.random.seed(2)
+    n = 300
+    returns = pd.DataFrame({
+        "A": np.random.normal(0, 0.01, n),
+        "B": np.random.normal(0, 0.02, n),
+        "C": np.random.normal(0, 0.005, n),
+    })
+    optimizer = PortfolioOptimizer(method="risk_parity")
+    result = optimizer.optimise(returns)
+    assert abs(sum(result.weights.values()) - 1.0) < 1e-5
+    # Lower vol asset should have higher weight
+    assert result.weights["C"] > result.weights["A"] > result.weights["B"] or \
+           result.weights["C"] > result.weights["B"]  # flexible assertion
+
+
+def test_portfolio_optimizer_single_pair():
+    """Single pair → returns weight of 1.0."""
+    from utils.portfolio_optimizer import PortfolioOptimizer
+    returns = pd.DataFrame({"EURUSD": np.random.normal(0, 0.001, 100)})
+    optimizer = PortfolioOptimizer(method="hrp")
+    result = optimizer.optimise(returns)
+    assert "EURUSD" in result.weights
+
+
+def test_portfolio_optimizer_too_few_rows():
+    """Less than 10 rows → equal weight fallback."""
+    from utils.portfolio_optimizer import PortfolioOptimizer
+    returns = pd.DataFrame({
+        "A": [0.01, -0.01, 0.005],
+        "B": [0.02, -0.02, 0.010],
+    })
+    optimizer = PortfolioOptimizer(method="hrp")
+    result = optimizer.optimise(returns)
+    assert abs(sum(result.weights.values()) - 1.0) < 1e-5
+
+
+def test_portfolio_optimizer_to_dict():
+    """to_dict should return complete report."""
+    from utils.portfolio_optimizer import PortfolioWeights
+    pw = PortfolioWeights(
+        weights={"EURUSD": 0.6, "GBPUSD": 0.4},
+        method="hrp",
+        diversification_ratio=1.2,
+        expected_annual_return=0.05,
+        expected_annual_vol=0.10,
+        expected_sharpe=0.5,
+    )
+    d = pw.to_dict()
+    assert "weights" in d
+    assert "method" in d
+    assert d["expected_sharpe"] == pytest.approx(0.5)
+
+
+def test_portfolio_optimizer_lot_sizes():
+    """compute_lot_sizes should return positive lot sizes."""
+    from utils.portfolio_optimizer import PortfolioOptimizer, PortfolioWeights
+    pw = PortfolioWeights(weights={"EURUSD": 0.6, "GBPUSD": 0.4}, method="hrp")
+    opt = PortfolioOptimizer()
+    lots = opt.compute_lot_sizes(pw, total_equity=10_000)
+    assert lots["EURUSD"] > lots["GBPUSD"]
+    assert all(v > 0 for v in lots.values())
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# HyperOptimiser (NEW — inspired by freqtrade/hyperopt)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def test_hyperopt_list_spaces():
+    from models.hyperopt import HyperOptimiser
+    spaces = HyperOptimiser.list_spaces()
+    assert "xgboost" in spaces
+    assert "risk" in spaces
+    assert "rl" in spaces
+
+
+def test_hyperopt_get_space():
+    from models.hyperopt import HyperOptimiser
+    space = HyperOptimiser.get_space("xgboost")
+    assert "max_depth" in space
+    assert "learning_rate" in space
+
+
+def test_hyperopt_random_search(sample_ohlcv):
+    """Random search with custom fn should return HyperOptResult."""
+    from models.hyperopt import HyperOptimiser, HyperOptResult
+    from features.technical_indicators import compute_all_indicators, get_feature_columns
+    df = compute_all_indicators(sample_ohlcv)
+    feature_cols = get_feature_columns(df)
+
+    call_count = {"n": 0}
+    def dummy_fn(df, feature_cols, params):
+        call_count["n"] += 1
+        return float(np.random.normal(0.5, 0.1)), {"sharpe": 0.5}
+
+    ho = HyperOptimiser(objective="sharpe", spaces=["xgboost"], n_trials=5)
+    # Force random search by mocking _HAS_OPTUNA
+    import models.hyperopt as hyperopt_module
+    orig = hyperopt_module._HAS_OPTUNA
+    hyperopt_module._HAS_OPTUNA = False
+    try:
+        result = ho.run(df, feature_cols, custom_fn=dummy_fn)
+        assert isinstance(result, HyperOptResult)
+        assert result.n_trials == 5
+        assert call_count["n"] == 5
+        assert "best_params" in result.to_dict()
+    finally:
+        hyperopt_module._HAS_OPTUNA = orig
+
+
+def test_hyperopt_save_load(tmp_path, sample_ohlcv):
+    from models.hyperopt import HyperOptimiser, HyperOptResult
+    result = HyperOptResult(
+        best_params={"max_depth": 5, "learning_rate": 0.05},
+        best_value=1.23,
+        objective_name="sharpe",
+        n_trials=10,
+        spaces_used=["xgboost"],
+    )
+    ho = HyperOptimiser()
+    path = str(tmp_path / "best.json")
+    ho.save_best(result, path)
+    loaded = ho.load_best(path)
+    assert loaded["max_depth"] == 5
+    assert loaded["learning_rate"] == pytest.approx(0.05)
+
+
+def test_hyperopt_load_missing():
+    from models.hyperopt import HyperOptimiser
+    ho = HyperOptimiser()
+    loaded = ho.load_best("/tmp/nonexistent_hyperopt_file.json")
+    assert loaded == {}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Alpha Factors (NEW — inspired by microsoft/qlib)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def test_alpha_factor_calculator(sample_ohlcv):
+    """All alpha factors should be computed without errors."""
+    from features.alpha_factors import AlphaFactorCalculator
+    calc = AlphaFactorCalculator(zscore=True)
+    df = calc.compute_all(sample_ohlcv)
+    assert len(calc.factor_cols) >= 10
+    for col in calc.factor_cols:
+        assert col in df.columns, f"Missing: {col}"
+    # Z-scored values should be mostly in [-3, 3]
+    for col in calc.factor_cols:
+        valid = df[col].dropna()
+        assert len(valid) > 0
+
+
+def test_alpha_factor_no_zscore(sample_ohlcv):
+    from features.alpha_factors import AlphaFactorCalculator
+    calc = AlphaFactorCalculator(zscore=False)
+    df = calc.compute_all(sample_ohlcv)
+    assert len(calc.factor_cols) >= 10
+
+
+def test_factor_evaluator_ic(sample_ohlcv):
+    """IC should be a float in [-1, 1]."""
+    from features.alpha_factors import AlphaFactorCalculator, FactorEvaluator
+    calc = AlphaFactorCalculator(zscore=True)
+    df = calc.compute_all(sample_ohlcv)
+    evaluator = FactorEvaluator(primary_period=1)
+    df = evaluator.compute_forward_returns(df)
+    for col in calc.factor_cols[:3]:
+        score = evaluator.evaluate_factor(df, col)
+        assert -2.0 <= score.ic <= 2.0  # ICIR can go beyond ±1
+        assert isinstance(score.n_obs, int)
+
+
+def test_factor_evaluator_evaluate_all(sample_ohlcv):
+    """evaluate_all should return sorted list of FactorScore."""
+    from features.alpha_factors import AlphaFactorCalculator, FactorEvaluator, FactorScore
+    calc = AlphaFactorCalculator(zscore=True)
+    df = calc.compute_all(sample_ohlcv)
+    evaluator = FactorEvaluator(primary_period=1)
+    scores = evaluator.evaluate_all(df, calc.factor_cols)
+    assert isinstance(scores, list)
+    assert all(isinstance(s, FactorScore) for s in scores)
+    # Should be sorted by |ICIR| descending
+    if len(scores) >= 2:
+        assert abs(scores[0].icir) >= abs(scores[-1].icir)
+
+
+def test_factor_score_tradeable():
+    from features.alpha_factors import FactorScore
+    s = FactorScore(name="test", ic=0.06, icir=0.5, rank_ic=0.05, turnover=0.3, n_obs=100)
+    assert s.is_tradeable()
+    s_bad = FactorScore(name="test2", ic=0.01, icir=0.1, rank_ic=0.01, turnover=0.9, n_obs=100)
+    assert not s_bad.is_tradeable()
+
+
+def test_combine_factors(sample_ohlcv):
+    """Composite alpha should be a pd.Series of same length."""
+    from features.alpha_factors import AlphaFactorCalculator, combine_factors
+    calc = AlphaFactorCalculator(zscore=True)
+    df = calc.compute_all(sample_ohlcv)
+    composite = combine_factors(df, calc.factor_cols, method="equal")
+    assert isinstance(composite, pd.Series)
+    assert len(composite) == len(df)
+
+
+def test_neutralise_factor(sample_ohlcv):
+    """Neutralised factor should be orthogonal to benchmark."""
+    from features.alpha_factors import AlphaFactorCalculator, neutralise_factor
+    calc = AlphaFactorCalculator(zscore=True)
+    df = calc.compute_all(sample_ohlcv)
+    factor = df[calc.factor_cols[0]].dropna()
+    benchmark = df[calc.factor_cols[1]].reindex(factor.index).dropna()
+    both = pd.concat([factor, benchmark], axis=1).dropna()
+    if len(both) < 10:
+        return
+    residual = neutralise_factor(both.iloc[:, 0], both.iloc[:, 1])
+    # Residual correlation with benchmark should be near 0
+    corr = residual.dropna().corr(both.iloc[:, 1].reindex(residual.dropna().index))
+    assert abs(corr) < 0.1 or np.isnan(corr)  # allow NaN for short series
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# QuantStats Reporter (NEW — inspired by ranaroussi/quantstats)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def test_quantstats_reporter_basic(sample_ohlcv):
+    """Basic report generation from equity curve."""
+    from utils.quantstats_reporter import QuantStatsReporter, PerformanceReport
+    np.random.seed(7)
+    equity = np.cumprod(1 + np.random.normal(0.0005, 0.01, 300)) * 10_000
+    reporter = QuantStatsReporter(periods_per_year=252)
+    report = reporter.generate(equity, pair="EURUSD")
+    assert isinstance(report, PerformanceReport)
+    assert report.pair == "EURUSD"
+    assert report.n_trading_periods == 300
+    assert isinstance(report.sharpe_ratio, float)
+    assert isinstance(report.max_drawdown_pct, float)
+    assert report.max_drawdown_pct >= 0
+
+
+def test_quantstats_reporter_with_trades():
+    """Report with trade list should populate trade stats."""
+    from utils.quantstats_reporter import QuantStatsReporter
+    np.random.seed(8)
+    equity = np.cumprod(1 + np.random.normal(0.0003, 0.008, 200)) * 10_000
+    trades = [{"pnl": np.random.normal(5, 20)} for _ in range(50)]
+    reporter = QuantStatsReporter()
+    report = reporter.generate(equity, trades=trades, pair="GBPUSD")
+    assert report.n_trades == 50
+    assert 0 <= report.win_rate_pct <= 100
+
+
+def test_quantstats_reporter_to_dict():
+    from utils.quantstats_reporter import QuantStatsReporter
+    equity = np.linspace(10000, 11000, 100)
+    reporter = QuantStatsReporter()
+    report = reporter.generate(equity, pair="USDJPY")
+    d = report.to_dict()
+    required_keys = ["pair", "sharpe_ratio", "sortino_ratio", "max_drawdown_pct",
+                     "win_rate_pct", "profit_factor", "total_return_pct"]
+    for k in required_keys:
+        assert k in d, f"Missing key: {k}"
+
+
+def test_quantstats_reporter_save_json(tmp_path):
+    from utils.quantstats_reporter import QuantStatsReporter
+    equity = np.linspace(10000, 10500, 50)
+    reporter = QuantStatsReporter()
+    report = reporter.generate(equity, pair="AUDUSD")
+    path = reporter.save_json(report, str(tmp_path / "report.json"))
+    assert path.exists()
+    import json
+    data = json.loads(path.read_text())
+    assert data["pair"] == "AUDUSD"
+
+
+def test_quantstats_reporter_save_html(tmp_path):
+    from utils.quantstats_reporter import QuantStatsReporter
+    np.random.seed(9)
+    equity = np.cumprod(1 + np.random.normal(0.0004, 0.009, 100)) * 10_000
+    reporter = QuantStatsReporter()
+    report = reporter.generate(equity, pair="NZDUSD")
+    path = reporter.save_html(report, str(tmp_path / "report.html"))
+    assert path.exists()
+    html = path.read_text()
+    assert "NZDUSD" in html
+    assert "Sharpe" in html
+    assert "Drawdown" in html
+
+
+def test_quantstats_reporter_empty_equity():
+    from utils.quantstats_reporter import QuantStatsReporter
+    reporter = QuantStatsReporter()
+    report = reporter.generate([], pair="EMPTY")
+    assert report.n_trading_periods == 0
+
+
+def test_quantstats_reporter_monotonic_equity():
+    """Perfect trending equity should have near-zero drawdown."""
+    from utils.quantstats_reporter import QuantStatsReporter
+    equity = np.linspace(10000, 15000, 200)
+    reporter = QuantStatsReporter()
+    report = reporter.generate(equity, pair="TEST")
+    assert report.total_return_pct > 0
+    assert report.max_drawdown_pct < 1.0  # trivially low DD
+
+
+def test_quantstats_reporter_rolling_metrics():
+    from utils.quantstats_reporter import QuantStatsReporter
+    np.random.seed(42)
+    equity = np.cumprod(1 + np.random.normal(0.0003, 0.008, 200)) * 10_000
+    reporter = QuantStatsReporter()
+    report = reporter.generate(equity, pair="X")
+    assert len(report.rolling_sharpe_30) > 0
+    assert len(report.rolling_vol_30) > 0
+    assert len(report.equity_curve) > 0

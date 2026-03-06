@@ -28,6 +28,7 @@ from features.candle_patterns import compute_candle_features
 from features.regime_detector import detect_regime
 from features.multi_timeframe import MultiTimeframeAnalyser
 from features.order_flow import compute_order_flow_features, get_order_flow_signal
+from features.alpha_factors import AlphaFactorCalculator, FactorEvaluator, combine_factors
 from agents.sentiment_agent import SentimentAgent
 from agents.technical_agent import TechnicalAgent
 from agents.correlation_agent import CorrelationAgent
@@ -41,6 +42,8 @@ from memory.vector_memory import TradingMemory
 from models.ensemble_stacker import EnsembleStacker
 from utils.trade_journal import TradeJournal
 from utils.alert_manager import AlertManager, AlertConfig
+from utils.portfolio_optimizer import PortfolioOptimizer
+from utils.quantstats_reporter import QuantStatsReporter
 from xai.explainer import ForexExplainer
 
 logger = logging.getLogger(__name__)
@@ -120,6 +123,17 @@ class ForexOrchestrator:
             cfg=AlertConfig(**cfg.get("alerts", {})) if cfg.get("alerts") else None,
         )
         self._stackers: dict[str, EnsembleStacker] = {}
+        self._portfolio_optimizer = PortfolioOptimizer(
+            method=cfg.get("portfolio", {}).get("method", "hrp"),
+            min_weight=cfg.get("portfolio", {}).get("min_weight", 0.02),
+            max_weight=cfg.get("portfolio", {}).get("max_weight", 0.40),
+        )
+        self._reporter = QuantStatsReporter(
+            periods_per_year=cfg.get("reporting", {}).get("periods_per_year", 1460),
+        )
+        self._alpha_calculator = AlphaFactorCalculator()
+        self._portfolio_weights: dict[str, float] = {}
+        self._returns_cache: dict[str, list[float]] = {}
         self.healer = SelfHealer(
             artifacts_dir=cfg.get("models", {}).get("models_dir", "artifacts/models"),
             watchdog_interval=cfg.get("monitoring", {}).get("watchdog_interval_seconds", 60),
@@ -316,8 +330,9 @@ class ForexOrchestrator:
             if df.empty or len(df) < 100:
                 return None
             df = compute_all_indicators(df, pair)
-            df = compute_candle_features(df)      # candle patterns
-            df = compute_order_flow_features(df)  # VWAP, delta, pressure
+            df = compute_candle_features(df)          # candle patterns
+            df = compute_order_flow_features(df)      # VWAP, delta, pressure
+            df = self._alpha_calculator.compute_all(df)  # alpha factors
             self._df_cache[pair] = df
             feature_cols = get_feature_columns(df)
             if not self._feature_cols:
@@ -422,13 +437,19 @@ class ForexOrchestrator:
             logger.info("%s: Sentiment disagrees (sent=%d, dir=%d) — skipping", pair, sentiment_signal, direction)
             return None
 
-        # 7. Risk sizing
+        # 7. Risk sizing — scale by portfolio weight if available
         latest = df.iloc[-1]
         atr = float(latest.get("atr_14", 0.001))
         entry_price = float(latest["close"])
+        # Apply portfolio weight to position size (default to equal weight across pairs)
+        portfolio_weight = self._portfolio_weights.get(pair, 1.0 / max(len(self.pairs), 1))
         pos_risk = self.risk_manager.compute_position_size(
             pair, direction, entry_price, atr, confidence=confidence
         )
+        # Scale position size by portfolio weight: weight already sums to 1 across pairs
+        # so we scale down proportionally (no multiplication by pair count needed)
+        if pos_risk and "lot_size" in pos_risk:
+            pos_risk["lot_size"] = round(pos_risk["lot_size"] * portfolio_weight, 3)
 
         # 8. Monte Carlo pre-trade check
         var_stats = self.risk_manager.monte_carlo_var(n_paths=500)
@@ -551,7 +572,55 @@ class ForexOrchestrator:
         # Run alert checks
         self._run_alert_checks()
 
+        # Portfolio rebalancing (every N cycles, configurable)
+        if not hasattr(self, "_cycle_count"):
+            self._cycle_count = 0
+        self._cycle_count += 1
+        rebalance_every = self.cfg.get("portfolio", {}).get("rebalance_cycles", 20)
+        if self._cycle_count % max(rebalance_every, 1) == 1:
+            self._rebalance_portfolio()
+
         return trades
+
+    def _rebalance_portfolio(self) -> None:
+        """Recompute HRP portfolio weights from cached price data."""
+        try:
+            if len(self._df_cache) < 2:
+                return
+            returns_dict = {
+                pair: df["close"].pct_change().dropna()
+                for pair, df in self._df_cache.items()
+                if "close" in df.columns and len(df) >= 30
+            }
+            if len(returns_dict) < 2:
+                return
+            returns_df = pd.DataFrame(returns_dict).dropna()
+            weights = self._portfolio_optimizer.optimise(returns_df)
+            self._portfolio_weights = weights.weights
+            logger.info("Portfolio rebalanced: %s", {k: round(v, 3) for k, v in weights.weights.items()})
+            # Save for dashboard
+            Path("logs").mkdir(exist_ok=True)
+            Path("logs/portfolio_weights.json").write_text(json.dumps(weights.to_dict()))
+        except Exception as e:
+            logger.debug("Portfolio rebalance error: %s", e)
+
+    def generate_performance_report(self, pair: str = "") -> Optional[dict]:
+        """Generate a QuantStats-style performance report for a pair (or all pairs)."""
+        try:
+            snapshot = self.journal.get_summary()
+            equity_curve = snapshot.get("equity_curve", [])
+            trades = snapshot.get("trades", [])
+            if not equity_curve:
+                return None
+            report = self._reporter.generate(equity_curve, trades, pair=pair or "ALL")
+            out_dir = Path("reports")
+            out_dir.mkdir(exist_ok=True)
+            self._reporter.save_json(report, str(out_dir / f"{pair or 'ALL'}.json"))
+            self._reporter.save_html(report, str(out_dir / f"{pair or 'ALL'}.html"))
+            return report.to_dict()
+        except Exception as e:
+            logger.debug("Report generation error: %s", e)
+            return None
 
     def _run_alert_checks(self) -> None:
         """Run all alert checks after each cycle and persist summary."""
