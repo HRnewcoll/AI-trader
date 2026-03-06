@@ -352,6 +352,32 @@ def main():
         else:
             st.info("Health log will appear once the trader is running")
 
+    # ══════════════════════════════════════════════════════════════════════
+    # ROW 7 — Alerts Panel
+    # ══════════════════════════════════════════════════════════════════════
+    st.subheader("🚨 Alerts")
+    alert_summary = _load_json(Path("logs/alert_summary.json"), {})
+    recent_alerts = alert_summary.get("recent_alerts", [])
+    alert_counts = alert_summary.get("alert_counts", {})
+
+    if recent_alerts:
+        level_colors = {"critical": "🔴", "warning": "🟡", "info": "🔵"}
+        df_alerts = pd.DataFrame(recent_alerts)[["timestamp", "level", "alert_type", "message", "value"]]
+        df_alerts["level"] = df_alerts["level"].map(level_colors).fillna("⚪") + " " + df_alerts["level"]
+        st.dataframe(df_alerts, use_container_width=True, height=200)
+
+        if alert_counts:
+            fig_ac = px.bar(
+                x=list(alert_counts.keys()),
+                y=list(alert_counts.values()),
+                title="Alert Frequency by Type",
+            )
+            fig_ac.update_layout(template="plotly_dark", height=200,
+                                  margin=dict(l=0, r=0, t=30, b=0))
+            st.plotly_chart(fig_ac, use_container_width=True)
+    else:
+        st.info("No alerts fired yet — system is healthy")
+
     # ── Footer ─────────────────────────────────────────────────────────────
     st.divider()
     updated = journal_snapshot.get("updated_at", "—")

@@ -27,16 +27,20 @@ from features.technical_indicators import compute_all_indicators, get_feature_co
 from features.candle_patterns import compute_candle_features
 from features.regime_detector import detect_regime
 from features.multi_timeframe import MultiTimeframeAnalyser
+from features.order_flow import compute_order_flow_features, get_order_flow_signal
 from agents.sentiment_agent import SentimentAgent
 from agents.technical_agent import TechnicalAgent
 from agents.correlation_agent import CorrelationAgent
 from agents.llm_orchestrator import LLMOrchestrator
+from agents.pattern_agent import PatternAgent
 from risk_healing.risk_manager import RiskManager, RiskConfig
 from risk_healing.self_healer import SelfHealer
 from notifications.notifier import Notifier, build_notifier_from_cfg
 from monitoring.metrics_server import MetricsServer
 from memory.vector_memory import TradingMemory
+from models.ensemble_stacker import EnsembleStacker
 from utils.trade_journal import TradeJournal
+from utils.alert_manager import AlertManager, AlertConfig
 from xai.explainer import ForexExplainer
 
 logger = logging.getLogger(__name__)
@@ -106,6 +110,16 @@ class ForexOrchestrator:
         self.mtf_analyser = MultiTimeframeAnalyser(
             timeframes=cfg.get("timeframes", {}).get("mtf", ["M15", "H1", "H4", "D1"]),
         )
+        self.pattern_agent = PatternAgent(
+            order=cfg.get("pattern_agent", {}).get("order", 5),
+            tolerance=cfg.get("pattern_agent", {}).get("tolerance", 0.025),
+            min_confidence=cfg.get("pattern_agent", {}).get("min_confidence", 0.50),
+        )
+        self.alert_manager = AlertManager(
+            notifier=self.notifier if hasattr(self, "notifier") else None,
+            cfg=AlertConfig(**cfg.get("alerts", {})) if cfg.get("alerts") else None,
+        )
+        self._stackers: dict[str, EnsembleStacker] = {}
         self.healer = SelfHealer(
             artifacts_dir=cfg.get("models", {}).get("models_dir", "artifacts/models"),
             watchdog_interval=cfg.get("monitoring", {}).get("watchdog_interval_seconds", 60),
@@ -302,7 +316,8 @@ class ForexOrchestrator:
             if df.empty or len(df) < 100:
                 return None
             df = compute_all_indicators(df, pair)
-            df = compute_candle_features(df)   # add candle patterns
+            df = compute_candle_features(df)      # candle patterns
+            df = compute_order_flow_features(df)  # VWAP, delta, pressure
             self._df_cache[pair] = df
             feature_cols = get_feature_columns(df)
             if not self._feature_cols:
@@ -348,6 +363,36 @@ class ForexOrchestrator:
             logger.info("%s: MTF block — %s", pair, mtf_reason)
             return None
         logger.debug("%s MTF: %s", pair, mtf_reason)
+
+        # 4f. Pattern agent
+        pattern_signal = self.pattern_agent.get_signal(df, pair)
+        if pattern_signal["signal"] != 0 and pattern_signal["signal"] != direction:
+            logger.info(
+                "%s: Chart pattern opposes signal (pattern=%+d, dir=%+d patterns=%s) — skipping",
+                pair, pattern_signal["signal"], direction, pattern_signal["patterns"],
+            )
+            return None
+
+        # 4g. Order flow signal
+        of_signal = get_order_flow_signal(df)
+        if of_signal["signal"] != 0 and of_signal["signal"] != direction:
+            logger.debug("%s: Order flow disagrees (%s) — weakening confidence", pair, of_signal["reason"])
+            confidence *= 0.85  # reduce but don't block
+
+        # 4h. Ensemble stacker — combine all model predictions
+        stacker = self._stackers.get(pair)
+        if stacker and self._models.get(pair):
+            try:
+                base_preds: dict[str, float] = {}
+                for model_name, model in self._models[pair].items():
+                    _, prob = model.predict_latest(df)
+                    base_preds[model_name] = float(prob)
+                stacked_dir, stacked_conf = stacker.predict(base_preds)
+                if stacked_conf > confidence * 1.05:
+                    direction = stacked_dir
+                    confidence = stacked_conf
+            except Exception as e:
+                logger.debug("Stacker predict error %s: %s", pair, e)
 
         # 4e. LLM orchestrator — final reasoning
         rl_signal = {"action": 1 if direction == 1 else (2 if direction == -1 else 0),
@@ -503,7 +548,26 @@ class ForexOrchestrator:
         self._save_mtf_status()
         self._save_journal_snapshot()
 
+        # Run alert checks
+        self._run_alert_checks()
+
         return trades
+
+    def _run_alert_checks(self) -> None:
+        """Run all alert checks after each cycle and persist summary."""
+        try:
+            equity = self.broker.get_account_equity()
+            self.alert_manager.check_all(
+                equity=equity,
+                peak_equity=self.risk_manager.peak_equity,
+                recent_pnls=self._recent_pnls,
+                daily_pnl=sum(self._recent_pnls[-20:]) if self._recent_pnls else 0.0,
+                is_circuit_broken=self.risk_manager.is_circuit_broken,
+                is_survival_mode=self.risk_manager.is_survival_mode,
+            )
+            self.alert_manager.save_summary_json()
+        except Exception as e:
+            logger.debug("Alert checks error: %s", e)
 
     def _save_mtf_status(self) -> None:
         """Write per-pair MTF results to logs/mtf_status.json for the dashboard."""

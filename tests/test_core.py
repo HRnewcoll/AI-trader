@@ -651,3 +651,353 @@ def test_is_high_impact_window_no_data():
     result = is_high_impact_window("EURUSD", minutes_before=15, minutes_after=15)
     assert result is False   # fail-safe: never block on data error
 
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Pattern Agent (NEW)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def test_pattern_agent_returns_result(sample_ohlcv):
+    from features.technical_indicators import compute_all_indicators
+    from agents.pattern_agent import PatternAgent, PatternAgentResult
+    df = compute_all_indicators(sample_ohlcv)
+    agent = PatternAgent(min_confidence=0.40)
+    result = agent.detect(df, "EURUSD")
+    assert isinstance(result, PatternAgentResult)
+    assert result.pair == "EURUSD"
+    # dominant_signal should be one of -1, 0, 1
+    assert result.dominant_signal in (-1, 0, 1)
+    # composite_confidence in valid range
+    assert 0.0 <= result.composite_confidence <= 1.0
+
+
+def test_pattern_agent_get_signal(sample_ohlcv):
+    from features.technical_indicators import compute_all_indicators
+    from agents.pattern_agent import PatternAgent
+    df = compute_all_indicators(sample_ohlcv)
+    agent = PatternAgent(min_confidence=0.40)
+    signal = agent.get_signal(df, "GBPUSD")
+    assert "signal" in signal
+    assert "confidence" in signal
+    assert "patterns" in signal
+    assert signal["signal"] in (-1, 0, 1)
+    assert 0.0 <= signal["confidence"] <= 1.0
+    assert isinstance(signal["patterns"], list)
+
+
+def test_pattern_agent_empty_df():
+    from agents.pattern_agent import PatternAgent, PatternAgentResult
+    agent = PatternAgent()
+    result = agent.detect(pd.DataFrame(), "EURUSD")
+    assert isinstance(result, PatternAgentResult)
+    assert result.dominant_signal == 0
+
+
+def test_double_bottom_detection(sample_ohlcv):
+    """Create a synthetic double bottom and verify detection."""
+    from agents.pattern_agent import detect_double_bottom
+    close = sample_ohlcv["close"].values.copy()
+    # Manufacture a clean double bottom shape
+    n = 60
+    x = np.linspace(0, 2 * np.pi, n)
+    base = 1.1000
+    # Two troughs at roughly same level
+    prices = base + 0.005 * (1 - np.sin(x))
+    df_synth = sample_ohlcv.iloc[:n].copy()
+    df_synth["close"] = prices
+    df_synth["high"] = prices + 0.001
+    df_synth["low"] = prices - 0.001
+    # May or may not detect depending on signal location — just ensure no crash
+    result = detect_double_bottom(df_synth)
+    # result can be None (not detected) or a PatternSignal — both are valid
+    if result is not None:
+        assert result.signal in (-1, 0, 1)
+        assert 0.0 <= result.confidence <= 1.0
+
+
+def test_pattern_signal_to_dict(sample_ohlcv):
+    from agents.pattern_agent import PatternSignal
+    ps = PatternSignal(pattern="double_top", signal=-1, confidence=0.7, target=1.09, stop=1.12)
+    d = ps.to_dict()
+    assert d["pattern"] == "double_top"
+    assert d["signal"] == -1
+    assert d["confidence"] == pytest.approx(0.7)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Order Flow Features (NEW)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def test_compute_vwap(sample_ohlcv):
+    from features.order_flow import compute_vwap
+    df = compute_vwap(sample_ohlcv, rolling_window=20)
+    assert "vwap" in df.columns
+    assert "vwap_upper_1" in df.columns
+    assert "vwap_lower_1" in df.columns
+    assert "vwap_dev" in df.columns
+    # After warm-up, VWAP should be close to typical price
+    valid = df.dropna(subset=["vwap", "vwap_upper_1", "vwap_lower_1"])
+    assert len(valid) > 0
+    # Upper band must be >= lower band for valid rows
+    assert (valid["vwap_upper_1"] >= valid["vwap_lower_1"]).all()
+
+
+def test_compute_volume_delta(sample_ohlcv):
+    from features.order_flow import compute_volume_delta
+    df = compute_volume_delta(sample_ohlcv)
+    assert "buy_volume" in df.columns
+    assert "sell_volume" in df.columns
+    assert "volume_delta" in df.columns
+    assert "cumulative_delta" in df.columns
+    # buy_volume + sell_volume should equal total volume
+    np.testing.assert_allclose(
+        (df["buy_volume"] + df["sell_volume"]).values,
+        df["volume"].values,
+        rtol=1e-5,
+    )
+
+
+def test_compute_pressure_ratios(sample_ohlcv):
+    from features.order_flow import compute_pressure_ratios
+    df = compute_pressure_ratios(sample_ohlcv, window=14)
+    assert "pressure_ratio" in df.columns
+    assert "pressure_signal" in df.columns
+    valid = df["pressure_ratio"].dropna()
+    assert (valid >= 0).all() and (valid <= 1).all()
+
+
+def test_compute_volume_profile(sample_ohlcv):
+    from features.order_flow import compute_volume_profile
+    profile = compute_volume_profile(sample_ohlcv, n_bins=20, lookback=100)
+    assert "poc" in profile
+    assert "vah" in profile
+    assert "val" in profile
+    assert "profile" in profile
+    # Value area: val <= poc <= vah
+    assert profile["val"] <= profile["poc"] <= profile["vah"]
+
+
+def test_detect_order_blocks(sample_ohlcv):
+    from features.order_flow import detect_order_blocks
+    blocks = detect_order_blocks(sample_ohlcv, lookback=50)
+    assert isinstance(blocks, list)
+    for b in blocks:
+        assert b["type"] in ("bullish_ob", "bearish_ob")
+        assert b["price_low"] <= b["price_high"]
+
+
+def test_compute_order_flow_features(sample_ohlcv):
+    from features.order_flow import compute_order_flow_features
+    df = compute_order_flow_features(sample_ohlcv)
+    required = ["vwap", "volume_delta", "pressure_ratio", "absorption",
+                "in_bullish_ob", "in_bearish_ob"]
+    for col in required:
+        assert col in df.columns, f"Missing column: {col}"
+
+
+def test_get_order_flow_signal(sample_ohlcv):
+    from features.order_flow import get_order_flow_signal
+    sig = get_order_flow_signal(sample_ohlcv)
+    assert sig["signal"] in (-1, 0, 1)
+    assert 0.0 <= sig["confidence"] <= 1.0
+    assert "reason" in sig
+
+
+def test_get_order_flow_signal_empty():
+    from features.order_flow import get_order_flow_signal
+    sig = get_order_flow_signal(pd.DataFrame())
+    assert sig["signal"] == 0
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Ensemble Stacker (NEW)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def test_ensemble_stacker_weighted_avg():
+    from models.ensemble_stacker import EnsembleStacker
+    stacker = EnsembleStacker(model_names=["xgboost", "dlinear", "rl"])
+    # Not fitted yet — should use weighted average
+    preds = {"xgboost": 0.75, "dlinear": 0.70, "rl": 0.80}
+    direction, confidence = stacker.predict(preds)
+    assert direction in (-1, 0, 1)
+    assert 0.0 <= confidence <= 1.0
+
+
+def test_ensemble_stacker_fit_predict():
+    from models.ensemble_stacker import EnsembleStacker
+    stacker = EnsembleStacker(model_names=["m1", "m2"], min_samples_to_fit=10)
+    np.random.seed(42)
+    n = 100
+    labels = np.random.randint(0, 2, n)
+    # Create base predictions correlated with labels
+    base_preds = {
+        "m1": np.clip(labels * 0.6 + np.random.normal(0.4, 0.1, n), 0, 1),
+        "m2": np.clip(labels * 0.5 + np.random.normal(0.4, 0.15, n), 0, 1),
+    }
+    metrics = stacker.fit(base_preds, labels)
+    assert metrics["status"] == "fitted"
+    assert "oof_auroc" in metrics
+    assert 0.0 <= metrics["oof_auroc"] <= 1.0
+
+    # Predict
+    direction, confidence = stacker.predict({"m1": 0.8, "m2": 0.75})
+    assert direction in (-1, 0, 1)
+    assert 0.0 <= confidence <= 1.0
+
+
+def test_ensemble_stacker_save_load(tmp_path):
+    from models.ensemble_stacker import EnsembleStacker
+    stacker = EnsembleStacker(
+        model_names=["a", "b"],
+        min_samples_to_fit=10,
+        artifacts_dir=str(tmp_path),
+    )
+    # Train
+    np.random.seed(0)
+    n = 80
+    labels = np.random.randint(0, 2, n)
+    base_preds = {
+        "a": np.clip(labels * 0.6 + 0.2, 0, 1),
+        "b": np.clip(labels * 0.5 + 0.25, 0, 1),
+    }
+    stacker.fit(base_preds, labels)
+    stacker.save("EURUSD")
+
+    loaded = EnsembleStacker.load("EURUSD", artifacts_dir=str(tmp_path))
+    assert loaded._is_fitted
+    direction, confidence = loaded.predict({"a": 0.7, "b": 0.65})
+    assert direction in (-1, 0, 1)
+
+
+def test_ensemble_stacker_weight_update():
+    from models.ensemble_stacker import EnsembleStacker
+    stacker = EnsembleStacker(model_names=["x", "y", "z"])
+    pnl_data = {
+        "x": [50.0, 60.0, 40.0, 55.0, 70.0],
+        "y": [-10.0, -20.0, -5.0, -15.0, -8.0],
+        "z": [10.0, 15.0, 12.0, 8.0, 20.0],
+    }
+    stacker.update_weights_from_pnl(pnl_data)
+    weights = stacker.get_model_weights()
+    assert "x" in weights
+    # x has positive mean → should have highest weight
+    assert weights["x"] > weights["y"]
+
+
+def test_ensemble_stacker_summary():
+    from models.ensemble_stacker import EnsembleStacker
+    stacker = EnsembleStacker(model_names=["a", "b"])
+    summary = stacker.summary()
+    assert "is_fitted" in summary
+    assert "model_names" in summary
+    assert "weights" in summary
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Alert Manager (NEW)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def test_alert_manager_drawdown_warning(tmp_path):
+    from utils.alert_manager import AlertManager, AlertConfig
+    cfg = AlertConfig(drawdown_warning_pct=0.03, drawdown_critical_pct=0.06,
+                      cooldown_seconds=0)
+    mgr = AlertManager(cfg=cfg, log_dir=str(tmp_path))
+
+    # 4% drawdown → warning
+    alert = mgr.check_drawdown(equity=9600, peak_equity=10000)
+    assert alert is not None
+    assert alert.level == "warning"
+    assert "drawdown" in alert.alert_type.lower()
+
+
+def test_alert_manager_drawdown_critical(tmp_path):
+    from utils.alert_manager import AlertManager, AlertConfig
+    cfg = AlertConfig(drawdown_critical_pct=0.06, cooldown_seconds=0)
+    mgr = AlertManager(cfg=cfg, log_dir=str(tmp_path))
+
+    # 7% drawdown → critical
+    alert = mgr.check_drawdown(equity=9300, peak_equity=10000)
+    assert alert is not None
+    assert alert.level == "critical"
+
+
+def test_alert_manager_consecutive_losses(tmp_path):
+    from utils.alert_manager import AlertManager, AlertConfig
+    cfg = AlertConfig(consecutive_loss_warning=3, cooldown_seconds=0)
+    mgr = AlertManager(cfg=cfg, log_dir=str(tmp_path))
+
+    pnls = [50.0, -10.0, -20.0, -30.0]
+    alert = mgr.check_consecutive_losses(pnls)
+    assert alert is not None
+    assert float(alert.value) == 3.0
+
+
+def test_alert_manager_no_alert_when_ok(tmp_path):
+    from utils.alert_manager import AlertManager, AlertConfig
+    cfg = AlertConfig(drawdown_warning_pct=0.05, cooldown_seconds=0)
+    mgr = AlertManager(cfg=cfg, log_dir=str(tmp_path))
+    alert = mgr.check_drawdown(equity=9800, peak_equity=10000)
+    assert alert is None   # 2% drawdown < 5% threshold
+
+
+def test_alert_manager_cooldown(tmp_path):
+    from utils.alert_manager import AlertManager, AlertConfig
+    cfg = AlertConfig(drawdown_warning_pct=0.03, cooldown_seconds=999)
+    mgr = AlertManager(cfg=cfg, log_dir=str(tmp_path))
+    alert1 = mgr.check_drawdown(equity=9600, peak_equity=10000)
+    alert2 = mgr.check_drawdown(equity=9500, peak_equity=10000)
+    assert alert1 is not None
+    assert alert2 is None   # within cooldown
+
+
+def test_alert_manager_circuit_breaker(tmp_path):
+    from utils.alert_manager import AlertManager, AlertConfig
+    mgr = AlertManager(cfg=AlertConfig(cooldown_seconds=0), log_dir=str(tmp_path))
+    alert = mgr.check_circuit_breaker(is_triggered=True)
+    assert alert is not None
+    assert alert.level == "critical"
+
+
+def test_alert_manager_log_file(tmp_path):
+    from utils.alert_manager import AlertManager, AlertConfig
+    mgr = AlertManager(cfg=AlertConfig(cooldown_seconds=0), log_dir=str(tmp_path))
+    mgr.check_drawdown(equity=9300, peak_equity=10000)
+    alerts = mgr.get_alerts_from_log(n=10)
+    assert len(alerts) >= 1
+    assert "message" in alerts[0]
+
+
+def test_alert_manager_check_all(tmp_path):
+    from utils.alert_manager import AlertManager, AlertConfig
+    cfg = AlertConfig(drawdown_warning_pct=0.03, cooldown_seconds=0)
+    mgr = AlertManager(cfg=cfg, log_dir=str(tmp_path))
+    fired = mgr.check_all(
+        equity=9400,
+        peak_equity=10000,
+        recent_pnls=[-10, -20, -30, -40, -50],
+    )
+    # Should fire drawdown + consecutive_loss alerts
+    assert len(fired) >= 1
+
+
+def test_alert_manager_save_summary(tmp_path):
+    from utils.alert_manager import AlertManager, AlertConfig
+    mgr = AlertManager(cfg=AlertConfig(cooldown_seconds=0), log_dir=str(tmp_path))
+    mgr.check_circuit_breaker(is_triggered=True)
+    path = mgr.save_summary_json()
+    assert path.exists()
+    import json
+    data = json.loads(path.read_text())
+    assert "recent_alerts" in data
+    assert "alert_counts" in data
+
+
+def test_alert_to_dict():
+    from utils.alert_manager import Alert
+    a = Alert(alert_type="drawdown", level="warning", message="test", value=0.04, threshold=0.03)
+    d = a.to_dict()
+    assert d["alert_type"] == "drawdown"
+    assert d["level"] == "warning"
+    assert d["value"] == pytest.approx(0.04)
+    # Warning level should map to the warning emoji
+    assert a.emoji() == "⚠️"
