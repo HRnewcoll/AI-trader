@@ -2,11 +2,13 @@
 """
 ╔══════════════════════════════════════════════════════════════════════════════╗
 ║          ForexAI — ONE-CLICK LAUNCHER                                       ║
-║  python run.py                  → starts everything in paper-trading mode   ║
-║  python run.py --mode live      → live trading (needs MT5 credentials)      ║
-║  python run.py --train-only     → train models then exit                    ║
-║  python run.py --dashboard-only → only start the Streamlit dashboard        ║
-║  python run.py --backtest       → run a backtest on configured pairs        ║
+║  python run.py                   → paper trading + dashboard (default)      ║
+║  python run.py --mode live       → live trading (needs MT5/OANDA creds)    ║
+║  python run.py --train-only      → train models then exit                   ║
+║  python run.py --dashboard-only  → only start the Streamlit dashboard       ║
+║  python run.py --backtest        → run walk-forward backtest then exit      ║
+║  python run.py --hyperopt        → Optuna hyperparameter search then exit   ║
+║  python run.py --generate-report → HTML + JSON performance report then exit ║
 ╚══════════════════════════════════════════════════════════════════════════════╝
 """
 from __future__ import annotations
@@ -138,6 +140,81 @@ def run_backtest() -> None:
     print("\n[backtest] ✓ Done")
 
 
+def run_hyperopt() -> None:
+    """Run Optuna hyperparameter optimisation and save best params."""
+    print("\n[hyperopt] Running hyperparameter optimisation...")
+    from utils.config_loader import load_config
+    from data_pipeline.market_data import fetch_ohlcv
+    from features.technical_indicators import compute_all_indicators, get_feature_columns
+    from models.hyperopt import HyperOptimiser
+
+    cfg = load_config()
+    ho_cfg = cfg.get("hyperopt", {})
+    pair = cfg.get("pairs", {}).get("majors", ["EURUSD"])[0]
+
+    print(f"  Fetching data for {pair}...")
+    df = fetch_ohlcv(pair, timeframe="H4", limit=2000, cfg=cfg)
+    if df.empty:
+        print(f"  ⚠ No data for {pair} — aborting hyperopt")
+        return
+
+    df = compute_all_indicators(df, pair)
+    feature_cols = get_feature_columns(df)
+
+    ho = HyperOptimiser(
+        objective=ho_cfg.get("objective", "sharpe"),
+        spaces=ho_cfg.get("spaces", ["xgboost", "risk"]),
+        n_trials=int(ho_cfg.get("n_trials", 50)),
+        n_jobs=int(ho_cfg.get("n_jobs", 1)),
+        storage=ho_cfg.get("storage"),
+    )
+
+    result = ho.run(df, feature_cols)
+    output = ho_cfg.get("output_path", "artifacts/hyperopt/best_params.json")
+    ho.save_best(result, output)
+    print(f"  Best {result.objective_name}: {result.best_value:.4f}")
+    print(f"  Best params: {result.best_params}")
+    print(f"\n[hyperopt] ✓ Done — saved to {output}")
+
+
+def run_generate_report() -> None:
+    """Generate QuantStats HTML + JSON performance report from trade journal."""
+    print("\n[report] Generating performance report...")
+    from utils.config_loader import load_config
+    from utils.trade_journal import TradeJournal
+    from utils.quantstats_reporter import QuantStatsReporter
+    from pathlib import Path
+
+    cfg = load_config()
+    report_cfg = cfg.get("reporting", {})
+    journal_dir = cfg.get("memory", {}).get("journal_dir", "artifacts/trade_journal")
+    output_dir = report_cfg.get("output_dir", "reports")
+    periods = int(report_cfg.get("periods_per_year", 1460))
+
+    journal = TradeJournal(journal_dir=journal_dir)
+    snapshot = journal.get_summary()
+    equity_curve = snapshot.get("equity_curve", [])
+    trades = snapshot.get("trades", [])
+
+    if not equity_curve:
+        print("  ⚠ No equity curve found in trade journal — run trading first to generate data")
+        return
+
+    reporter = QuantStatsReporter(periods_per_year=periods)
+    report = reporter.generate(equity_curve, trades=trades, pair="ALL")
+
+    out_dir = Path(output_dir)
+    json_path = reporter.save_json(report, str(out_dir / "performance.json"))
+    html_path = reporter.save_html(report, str(out_dir / "performance.html"))
+
+    print(f"  Total return : {report.total_return_pct:+.2f}%")
+    print(f"  Sharpe ratio : {report.sharpe_ratio:.3f}")
+    print(f"  Max drawdown : -{report.max_drawdown_pct:.2f}%")
+    print(f"  Win rate     : {report.win_rate_pct:.1f}%")
+    print(f"\n[report] ✓ HTML  → {html_path}")
+    print(f"[report] ✓ JSON  → {json_path}")
+
+
 def run_trader(mode: str = "paper") -> None:
     import os
     os.environ.setdefault("FOREX_MODE", mode)
@@ -165,6 +242,10 @@ def main() -> None:
                         help="Only launch the Streamlit dashboard")
     parser.add_argument("--backtest", action="store_true",
                         help="Run backtest then exit")
+    parser.add_argument("--hyperopt", action="store_true",
+                        help="Run Optuna hyperparameter optimisation then exit")
+    parser.add_argument("--generate-report", action="store_true",
+                        help="Generate HTML + JSON QuantStats performance report then exit")
     parser.add_argument("--force-retrain", action="store_true",
                         help="Force model retraining even if artifacts exist")
     parser.add_argument("--no-dashboard", action="store_true",
@@ -193,6 +274,14 @@ def main() -> None:
 
     if args.backtest:
         run_backtest()
+        return
+
+    if args.hyperopt:
+        run_hyperopt()
+        return
+
+    if args.generate_report:
+        run_generate_report()
         return
 
     if args.dashboard_only:

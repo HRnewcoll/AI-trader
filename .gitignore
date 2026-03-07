@@ -14,11 +14,18 @@ artifacts/models/*.pkl
 artifacts/models/*.pt
 artifacts/onnx/*.onnx
 artifacts/chromadb/
+artifacts/hyperopt/
 logs/
 *.log
+reports/
 node_modules/
 .DS_Store
 target/
 Cargo.lock
 *.so
 *.dylib
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.db               # SQLite files (Optuna storage)
+optuna.db

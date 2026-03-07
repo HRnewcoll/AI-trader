@@ -19,6 +19,7 @@ timeframes:
   primary: H4
   secondary: [H1, D1]
   scalp: M15
+  mtf: [M15, H1, H4, D1]      # Multi-timeframe confluence list
 
 # ── Trading Sessions (UTC) ─────────────────────────────
 sessions:
@@ -177,3 +178,45 @@ memory:
   chroma_persist_dir: artifacts/chromadb
   context_window: 100      # last N trades for context
   embedding_model: all-MiniLM-L6-v2
+  journal_dir: artifacts/trade_journal
+
+# ── Portfolio Optimizer ─────────────────────────────────
+portfolio:
+  method: hrp              # hrp | mvo | risk_parity
+  min_weight: 0.02         # minimum 2% per pair
+  max_weight: 0.40         # maximum 40% per pair
+  rebalance_cycles: 20     # rebalance every N trading cycles (≈ daily at 5-min cycle)
+  risk_free_rate: 0.0
+  trading_periods_per_year: 1460   # H4 bars per year
+
+# ── Pattern Agent ───────────────────────────────────────
+pattern_agent:
+  order: 5                 # peak/trough detection window (bars)
+  tolerance: 0.025         # price tolerance for pattern matching (2.5%)
+  min_confidence: 0.50     # minimum confidence to emit a pattern signal
+
+# ── Alert Manager ───────────────────────────────────────
+alerts:
+  drawdown_warn_pct: 3.0          # warn at 3% drawdown from peak
+  drawdown_critical_pct: 6.0      # critical at 6%
+  consecutive_loss_warn: 3        # warn after 3 consecutive losses
+  consecutive_loss_critical: 6    # critical after 6
+  daily_loss_limit_pct: 2.0       # block trading if daily P&L < -2%
+  large_loss_pct: 1.0             # alert on any single trade > 1% loss
+  min_confidence_threshold: 0.55  # alert if avg model confidence drops below this
+  cooldown_seconds: 300           # minimum 5 min between repeated alerts
+
+# ── Hyperparameter Optimiser ────────────────────────────
+hyperopt:
+  objective: sharpe        # sharpe | sortino | calmar | combined
+  spaces: [xgboost, risk]  # which param spaces to search
+  n_trials: 50             # number of Optuna trials
+  n_jobs: 1                # parallel trials (1 = sequential)
+  storage: null            # SQLite path for persistence, null = in-memory
+  output_path: artifacts/hyperopt/best_params.json
+
+# ── Reporting ───────────────────────────────────────────
+reporting:
+  output_dir: reports
+  periods_per_year: 1460   # H4 = 6 bars/day × 365 ≈ 1460
+  risk_free_rate: 0.0
